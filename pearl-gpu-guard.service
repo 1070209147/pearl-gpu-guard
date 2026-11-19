@@ -1,0 +1,30 @@
+[Unit]
+Description=Pearl mining with priority for GPU workloads
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+User=pearl-guard
+Group=pearl-gpu
+StateDirectory=pearl-gpu-guard
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/pearl-gpu-guard
+ExecStart=/usr/bin/python3 -I /opt/pearl-gpu-guard/guard.py run
+Restart=on-failure
+RestartSec=10s
+KillMode=mixed
+TimeoutStopSec=15s
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

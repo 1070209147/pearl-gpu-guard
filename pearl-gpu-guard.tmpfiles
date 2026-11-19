@@ -1,0 +1,3 @@
+d /run/pearl-gpu-guard 0750 root pearl-gpu -
+f /run/pearl-gpu-guard/demand.lock 0640 root pearl-gpu -
+f /run/pearl-gpu-guard/gpu.lock 0640 root pearl-gpu -

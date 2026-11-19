@@ -1,0 +1,17 @@
+name: Ubuntu 22.04 tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+      - run: bash -n install.sh
+      - run: systemd-analyze verify ./pearl-gpu-guard.service ./pearl-gpu-meter.service
