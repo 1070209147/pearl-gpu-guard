@@ -20,15 +20,6 @@ config=/etc/pearl-gpu-guard/config.json
 if [[ $# -gt 0 || ! -f $config ]]; then
     python3 -I guard.py configure "$@" > "$stage/config.json"
 fi
-candidate=$config
-if [[ -s $stage/config.json ]]; then
-    candidate=$stage/config.json
-fi
-uses_ipmi=$(python3 -I -c 'import json, sys; print(int(json.load(open(sys.argv[1])).get("ipmi", False)))' "$candidate")
-if [[ $uses_ipmi == 1 && ! -x /usr/bin/ipmitool ]]; then
-    printf '%s\n' 'Install ipmitool (sudo apt install ipmitool) before using --ipmi.' >&2
-    exit 2
-fi
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time 600 --retry 2 \
     "https://github.com/kryptex/krig-miner/releases/download/$release/$archive" -o "$stage/miner.tar.gz"
@@ -64,14 +55,10 @@ install -m 0755 "$stage/krig-miner" /opt/pearl-gpu-guard/krig-miner
 install -m 0755 guard.py /opt/pearl-gpu-guard/guard.py
 ln -sfn /opt/pearl-gpu-guard/guard.py /usr/local/bin/pearl-gpu-guard
 install -m 0644 pearl-gpu-guard.service /etc/systemd/system/pearl-gpu-guard.service
-install -m 0644 pearl-gpu-meter.service /etc/systemd/system/pearl-gpu-meter.service
 install -m 0644 pearl-gpu-guard.tmpfiles /etc/tmpfiles.d/pearl-gpu-guard.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/pearl-gpu-guard.conf
 systemctl daemon-reload
-if [[ $uses_ipmi == 1 ]]; then
-    systemctl enable pearl-gpu-meter.service
-    systemctl restart pearl-gpu-meter.service
-elif systemctl is-enabled --quiet pearl-gpu-meter.service || systemctl is-active --quiet pearl-gpu-meter.service; then
+if systemctl is-enabled --quiet pearl-gpu-meter.service || systemctl is-active --quiet pearl-gpu-meter.service; then
     systemctl disable --now pearl-gpu-meter.service
 fi
 systemctl enable --now pearl-gpu-guard.service

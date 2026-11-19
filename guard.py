@@ -10,7 +10,6 @@ import os
 import re
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import time
@@ -23,15 +22,18 @@ if sys.platform == "linux":
     import fcntl
 
 CONFIG = Path("/etc/pearl-gpu-guard/config.json")
-STATE = Path("/var/lib/pearl-gpu-guard")
+STATE = Path("/var/lib/pearl-gpu-controller")
 LOCKS = Path("/run/pearl-gpu-guard")
 MINER = Path("/opt/pearl-gpu-guard/krig-miner")
 POOL = "stratum+ssl://prl.kryptex.network:8048"
 SAMPLE_INTERVAL = 15
 GPU_COUNT = 8
+MINING_CAP_WATTS = 300
 STOP_TIMEOUT = 5
 RESUME_DELAY = 30
 PCI_PATTERN = re.compile(r"([0-9a-f]{4,8}):([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])")
+UUID_PATTERN = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
+SMI = "/usr/bin/nvidia-smi"
 
 
 def command(args: list[str]) -> str:
@@ -57,48 +59,52 @@ class GPU:
     temperature: float
     watts: float
     cap: float
+    uuid: str
+    requested_cap: float | None
+    minimum_cap: float | None
 
     def idle(self, config: dict) -> bool:
         return self.load <= config["idle_gpu_percent"] and self.used <= config["idle_memory_mib"]
 
 
 def read_gpus() -> list[GPU]:
-    fields = "pci.bus_id,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,enforced.power.limit"
-    output = command(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"])
+    fields = ("pci.bus_id,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,"
+              "enforced.power.limit,uuid,power.limit,power.min_limit")
+    output = command([SMI, f"--query-gpu={fields}", "--format=csv,noheader,nounits"])
     cards = []
-    for pci, load, used, total, temp, watts, cap in csv.reader(output.splitlines()):
+    for pci, load, used, total, temp, watts, cap, uuid, requested, minimum in csv.reader(output.splitlines()):
         match = PCI_PATTERN.fullmatch(pci.strip().lower())
         if not match or int(match[1], 16):
             raise ValueError("KRig short PCI ID requires PCI domain zero")
+        uuid = uuid.strip()
+        if not UUID_PATTERN.fullmatch(uuid):
+            raise ValueError("invalid NVIDIA GPU UUID")
+        requested_cap = supported_limit(requested)
+        minimum_cap = supported_limit(minimum)
         card = GPU(match[2], measure(load, maximum=100), measure(used), measure(total, minimum=1),
-                   measure(temp, maximum=120), measure(watts), measure(cap, minimum=1))
+                   measure(temp, maximum=120), measure(watts), supported_limit(cap) or math.inf,
+                   uuid, requested_cap, minimum_cap)
         if card.used > card.total:
             raise ValueError("GPU memory reading exceeds capacity")
         cards.append(card)
-    if len(cards) != GPU_COUNT or len({card.pci for card in cards}) != GPU_COUNT:
+    if (len(cards) != GPU_COUNT or len({card.pci for card in cards}) != GPU_COUNT
+            or len({card.uuid for card in cards}) != GPU_COUNT):
         raise ValueError(f"expected {GPU_COUNT} distinct NVIDIA GPUs, found {len(cards)}")
     return cards
 
 
 def compute_pids() -> set[int]:
-    output = command(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+    output = command([SMI, "--query-compute-apps=pid", "--format=csv,noheader,nounits"])
     pids = {int(line.strip()) for line in output.splitlines() if line.strip()}
     if any(pid <= 0 for pid in pids):
         raise ValueError("invalid GPU process ID")
     return pids
 
 
-def read_wall_power(path: Path) -> float:
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    with os.fdopen(os.open(path, flags),
-                   encoding="utf-8") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ValueError("meter input must be a regular file")
-        reading = json.loads(stream.read(4096))
-    sampled_at = measure(reading["sampled_at"], maximum=1e12)
-    if not -1 <= time.time() - sampled_at <= 10:
-        raise ValueError("meter reading is stale")
-    return measure(reading["watts"], minimum=1, maximum=10_000)
+def supported_limit(reading: str) -> float | None:
+    if reading.strip() in {"N/A", "[N/A]", "[Not Supported]"}:
+        return None
+    return measure(reading, minimum=1)
 
 
 def read_queue(config: dict) -> dict:
@@ -143,20 +149,59 @@ def prune_logs(directory: Path, current_night: str | None) -> int:
     return removed
 
 
-def choose_cards(cards: list[GPU], baseline_watts: float, config: dict) -> list[GPU]:
-    """Reserve incremental GPU watts at the wall plus an allowance for host variation."""
-    available = config["wall_limit_watts"] - config["headroom_watts"] - baseline_watts
-    def cost(card: GPU) -> float:
-        return max(0.0, card.cap - card.watts) / config["psu_efficiency_floor"]
-
+def choose_cards(cards: list[GPU], config: dict) -> list[GPU]:
     eligible = config.get("eligible_pci") or [card.pci for card in cards]
-    selected = []
-    for card in sorted(cards, key=lambda card: (cost(card), card.pci)):
-        extra = cost(card)
-        if card.pci in eligible and extra <= available:
-            selected.append(card)
-            available -= extra
-    return selected
+    return [
+        card for card in cards if card.pci in eligible and math.isfinite(card.cap)
+        and card.requested_cap is not None
+        and (max(card.requested_cap, card.cap) <= MINING_CAP_WATTS
+             or (card.minimum_cap is not None and card.minimum_cap <= MINING_CAP_WATTS))
+    ]
+
+
+def set_cap(uuid: str, watts: float) -> None:
+    if not UUID_PATTERN.fullmatch(uuid):
+        raise ValueError("invalid GPU UUID in power settings")
+    watts = measure(watts, minimum=1)
+    command([SMI, "-i", uuid, "--power-limit", f"{watts:.2f}"])
+    notify("WATCHDOG=1")
+
+
+def pending_restore() -> Path:
+    return STATE / "restore-power.json"
+
+
+def restore_power() -> None:
+    record = pending_restore()
+    if not record.exists():
+        return
+    entries = json.loads(record.read_text(encoding="utf-8"))
+    failures = []
+    for uuid, watts in entries.items():
+        try:
+            set_cap(uuid, watts)
+            result = command([SMI, "-i", uuid, "--query-gpu=power.limit",
+                              "--format=csv,noheader,nounits"])
+            if not math.isclose(measure(result, minimum=1), watts, abs_tol=0.01):
+                raise ValueError("driver did not restore the saved power limit")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"power restore pending | {uuid} | {exc}", flush=True)
+            failures.append(uuid)
+        notify("WATCHDOG=1")
+    if failures:
+        raise ValueError("GPU power restore incomplete; original limits retained for retry")
+    record.unlink()
+    print(f"restored GPU power settings | {len(entries)} cards", flush=True)
+
+
+def recover_power() -> None:
+    if pending_restore().exists():
+        fd = lock_file("gpu")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            restore_power()
+        finally:
+            os.close(fd)
 
 
 def lock_file(name: str) -> int:
@@ -203,36 +248,12 @@ def atomic_json(path: Path, payload: dict) -> None:
         temp.unlink(missing_ok=True)
 
 
-def run_ipmi_meter() -> None:
-    path = LOCKS / "power.json"
-    previously_failed = False
-    while True:
-        try:
-            output = command(["/usr/bin/ipmitool", "dcmi", "power", "reading"])
-            match = re.search(r"^\s*Instantaneous power reading:\s*(\d+)\s+Watts\s*$", output, re.M)
-            if not match or not re.search(r"^\s*Power reading state is:\s*activated\s*$",
-                                          output, re.M | re.I):
-                raise ValueError("BMC did not report an active DCMI power reading")
-            watts = measure(match[1], minimum=1, maximum=10_000)
-            atomic_json(path, {"watts": watts, "sampled_at": time.time()})
-            if previously_failed:
-                print("DCMI readings resumed", flush=True)
-            previously_failed = False
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            path.unlink(missing_ok=True)
-            if not previously_failed:
-                print(f"DCMI meter unavailable | {exc}", flush=True)
-            previously_failed = True
-        time.sleep(2)
-
-
 class Guard:
     def __init__(self, config: dict):
         self.config = config
         self.zone = ZoneInfo(config["timezone"])
         self.start = clock.fromisoformat(config["start"])
         self.end = clock.fromisoformat(config["end"])
-        self.power_file = Path(config["power_file"])
         self.miner = None
         self.caps: dict[str, float] = {}
         self.status = {"gpu": [], "queue": None}
@@ -241,8 +262,6 @@ class Guard:
         self.next_sample = 0.0
         self.last_night = object()
         self.stop_requested = False
-        fault_path = STATE / "power-fault.json"
-        self.fault_night = json.loads(fault_path.read_text())["night"] if fault_path.exists() else None
         self.demand_fd = lock_file("demand")
         self.gpu_fd = lock_file("gpu")
 
@@ -253,6 +272,8 @@ class Guard:
         atomic_json(STATE / "status.json", {
             **self.status, "reason": reason, "miner_pid": self.miner.pid if self.miner else None,
             "mining_pci": sorted(self.caps), "updated_at": datetime.now(self.zone).isoformat(),
+            "per_gpu_limit_watts": MINING_CAP_WATTS,
+            "power_snapshot_saved": pending_restore().exists(),
         })
 
     def start_miner(self, cards: list[GPU], night: str) -> None:
@@ -265,6 +286,8 @@ class Guard:
         with os.fdopen(fd, "ab") as log:
             self.miner = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log,
                                           stderr=subprocess.STDOUT, start_new_session=True,
+                                          user="pearl-guard", group="pearl-gpu", extra_groups=(),
+                                          cwd=MINER.parent, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
                                           pass_fds=(self.gpu_fd,))
         self.caps = {card.pci: card.cap for card in cards}
         self.report(f"miner started | GPUs {devices}")
@@ -283,7 +306,10 @@ class Guard:
             print(f"miner exited with code {self.miner.returncode}", flush=True)
         self.miner = None
         self.caps.clear()
-        fcntl.flock(self.gpu_fd, fcntl.LOCK_UN)
+        try:
+            restore_power()
+        finally:
+            fcntl.flock(self.gpu_fd, fcntl.LOCK_UN)
         print(f"miner stopped | {reason}", flush=True)
 
     def pause(self, reason: str) -> None:
@@ -291,16 +317,18 @@ class Guard:
         self.idle_since = None
         self.report(reason)
 
-    def sample(self, night: str | None, demand: bool, wall_watts: float | None) -> None:
+    def sample(self, night: str | None, demand: bool) -> None:
         self.status.update(gpu=[], queue=None, other_gpu_processes=None,
                            sampled_at=datetime.now(self.zone).isoformat())
         cards = read_gpus()
-        self.status["gpu"] = [asdict(card) for card in cards]
+        self.status["gpu"] = [
+            {**asdict(card), "cap": card.cap if math.isfinite(card.cap) else None} for card in cards
+        ]
         queue = read_queue(self.config)
         self.status["queue"] = queue
         foreign = compute_pids() - ({self.miner.pid} if self.miner else set())
         self.status["other_gpu_processes"] = len(foreign)
-        if not night or demand or wall_watts is None or self.fault_night == night:
+        if not night or demand:
             return
         if queue["queued"] or queue["running"] or foreign:
             self.pause("GPU workload active or queued")
@@ -312,14 +340,16 @@ class Guard:
             self.pause("GPU utilization or memory above idle threshold")
             return
         if self.miner:
-            if any(card.pci in self.caps and card.cap > self.caps[card.pci] for card in cards):
-                self.pause("GPU power cap increased")
+            if any(card.pci in self.caps and
+                   (card.cap > MINING_CAP_WATTS or card.requested_cap is None
+                    or card.requested_cap > MINING_CAP_WATTS) for card in cards):
+                self.pause("GPU power cap no longer verified")
             else:
                 self.report(self.reason or "mining")
             return
-        chosen = choose_cards(cards, wall_watts, self.config)
+        chosen = choose_cards(cards, self.config)
         if not chosen:
-            self.pause("no GPU fits the wall power budget at its enforced power cap")
+            self.pause("no GPU can verify a power cap of at most 300 W")
             return
         now = time.monotonic()
         if self.idle_since is None:
@@ -337,22 +367,43 @@ class Guard:
             if night_key(datetime.now(self.zone), self.start, self.end) != night:
                 self.pause("outside mining hours")
                 return
-            # The most recent valid meter reading can change while GPU probes run.
-            refreshed = read_wall_power(self.power_file)
-            chosen = choose_cards(cards, max(wall_watts, refreshed), self.config)
-            if not chosen:
-                self.pause("no GPU fits the refreshed power budget")
-                return
-            self.start_miner(chosen, night)
+            restore_power()
+            prepared = self.prepare_cards(chosen, night)
+            if prepared:
+                self.start_miner(prepared, night)
         finally:
             if self.miner is None:
-                fcntl.flock(self.gpu_fd, fcntl.LOCK_UN)
+                try:
+                    restore_power()
+                finally:
+                    fcntl.flock(self.gpu_fd, fcntl.LOCK_UN)
+
+    def prepare_cards(self, cards: list[GPU], night: str) -> list[GPU]:
+        original = {card.uuid: card.requested_cap for card in cards
+                    if card.requested_cap > MINING_CAP_WATTS}
+        if original:
+            atomic_json(pending_restore(), original)
+        for card in cards:
+            if self.stop_requested or has_demand(self.demand_fd):
+                self.pause("GPU task requested")
+                return []
+            if card.uuid in original:
+                set_cap(card.uuid, MINING_CAP_WATTS)
+        verified = {card.uuid: card for card in read_gpus()}
+        prepared = [verified[card.uuid] for card in cards]
+        if any(card.cap > MINING_CAP_WATTS or card.requested_cap is None
+               or card.requested_cap > MINING_CAP_WATTS for card in prepared):
+            raise ValueError("driver did not verify the mining power caps")
+        if (self.stop_requested or has_demand(self.demand_fd) or compute_pids()
+                or night_key(datetime.now(self.zone), self.start, self.end) != night):
+            self.pause("GPU request, running task or shutdown during preparation")
+            return []
+        return prepared
 
     def tick(self) -> None:
         night = night_key(datetime.now(self.zone), self.start, self.end)
         demand = has_demand(self.demand_fd)
         self.status["task_requested_or_running"] = demand
-        self.status["wall_watts"] = None
         if not night:
             self.pause("outside mining hours")
         elif demand:
@@ -364,26 +415,13 @@ class Guard:
             if removed:
                 print(f"expired nightly diagnostic files removed | {removed}", flush=True)
             self.last_night = night
-        wall = None
-        if night:
-            try:
-                wall = read_wall_power(self.power_file)
-                self.status["wall_watts"] = wall
-            except (OSError, ValueError, TypeError, KeyError) as exc:
-                self.pause(f"wall power unavailable | {exc}")
-            if wall is not None and wall >= self.config["wall_limit_watts"] and self.miner:
-                self.pause(f"wall power limit exceeded | {wall:.1f} W")
-                self.fault_night = night
-                atomic_json(STATE / "power-fault.json", {"night": night, "watts": wall})
-            if self.fault_night == night:
-                self.pause("whole-machine power exceeded budget earlier this night")
         now = time.monotonic()
         if now >= self.next_sample:
             self.next_sample = now + SAMPLE_INTERVAL
             try:
-                self.sample(night, demand, wall)
+                self.sample(night, demand)
             except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
-                self.pause(f"GPU, queue or meter probe failed | {exc}")
+                self.pause(f"GPU or queue probe failed | {exc}")
         self.report(self.reason or "waiting for sensors")
 
     def run(self) -> None:
@@ -393,6 +431,7 @@ class Guard:
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         try:
+            recover_power()
             self.report("controller ready")
             notify("READY=1")
             while not self.stop_requested:
@@ -428,12 +467,19 @@ def run_task(args: list[str]) -> int:
             previous[sig] = signal.signal(sig, forward)
         fcntl.flock(demand, fcntl.LOCK_SH)
         print("GPU requested. Waiting for miner to release it.", file=sys.stderr, flush=True)
+        deadline = time.monotonic() + 60
         while not interrupted:
             try:
                 fcntl.flock(gpu, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
-                time.sleep(0.1)
+                pass
+            else:
+                if not pending_restore().exists():
+                    break
+                fcntl.flock(gpu, fcntl.LOCK_UN)
+            if time.monotonic() >= deadline:
+                raise ValueError("GPU unavailable: miner exit or power restoration is pending")
+            time.sleep(0.1)
         if interrupted:
             return 128 + interrupted
         print("GPU released. Starting workload.", file=sys.stderr, flush=True)
@@ -460,8 +506,6 @@ def configure(args: argparse.Namespace) -> dict:
         raise ValueError("invalid Pearl receive address or Kryptex Mining Username")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", args.worker):
         raise ValueError("worker must be 1–32 letters, digits, underscores or hyphens")
-    if args.power_file and not Path(args.power_file).is_absolute():
-        raise ValueError("use an absolute path for the meter file")
     if args.slurm_partition and not re.fullmatch(r"[A-Za-z0-9_.-]+", args.slurm_partition):
         raise ValueError("invalid Slurm partition")
     devices = args.eligible_pci.lower().split(",") if args.eligible_pci else []
@@ -470,10 +514,7 @@ def configure(args: argparse.Namespace) -> dict:
     return {
         "timezone": args.timezone, "start": start.isoformat(), "end": end.isoformat(),
         "payout": args.payout, "worker": args.worker,
-        "power_file": str(LOCKS / "power.json") if args.ipmi else args.power_file,
-        "ipmi": args.ipmi,
         "slurm_partition": args.slurm_partition, "eligible_pci": devices,
-        "wall_limit_watts": 300, "headroom_watts": 15, "psu_efficiency_floor": 0.80,
         "idle_gpu_percent": 5, "idle_memory_mib": 512, "max_temperature_c": 75,
     }
 
@@ -483,14 +524,11 @@ def main() -> int:
     modes = parser.add_subparsers(dest="mode", required=True)
     modes.add_parser("run")
     modes.add_parser("status")
-    modes.add_parser("ipmi-meter")
+    modes.add_parser("restore-power")
     task = modes.add_parser("task")
     task.add_argument("args", nargs=argparse.REMAINDER)
     setup = modes.add_parser("configure")
     setup.add_argument("--payout", required=True)
-    meter = setup.add_mutually_exclusive_group(required=True)
-    meter.add_argument("--power-file")
-    meter.add_argument("--ipmi", action="store_true")
     setup.add_argument("--worker", default=socket.gethostname().split(".")[0][:32])
     setup.add_argument("--timezone", default="Asia/Shanghai")
     setup.add_argument("--start", default="23:00")
@@ -500,8 +538,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.mode == "configure":
         print(json.dumps(configure(args), indent=2))
-    elif args.mode == "ipmi-meter":
-        run_ipmi_meter()
+    elif args.mode == "restore-power":
+        if os.getuid() != 0:
+            raise ValueError("power restoration requires root")
+        recover_power()
     elif args.mode == "status":
         job = subprocess.run(["systemctl", "is-active", "pearl-gpu-guard.service"],
                              capture_output=True, text=True, timeout=3, check=False)
@@ -512,8 +552,8 @@ def main() -> int:
     elif args.mode == "task":
         return run_task(args.args[1:] if args.args[:1] == ["--"] else args.args)
     else:
-        if os.getuid() == 0:
-            raise ValueError("run via systemd as pearl-guard, not as root")
+        if os.getuid() != 0 or not os.environ.get("NOTIFY_SOCKET"):
+            raise ValueError("start the root supervisor via systemd")
         Guard(json.loads(CONFIG.read_text())).run()
     return 0
 
