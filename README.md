@@ -4,27 +4,23 @@
 
 ## 安装并启动
 
-主机上应已安装 NVIDIA 驱动、`nvidia-smi`、`curl` 和 Git。首次运行时填写自己的 Pearl 公开收款地址或 Kryptex Mining Username。每台主机用独立 worker 名，默认取主机名。
-
-如果服务器带支持 DCMI 的本地 BMC，先装 `ipmitool` 并确认 `sudo ipmitool dcmi power reading` 返回有效的整机输入功率。然后在仓库目录运行：
+主机上应已安装 NVIDIA 驱动、`nvidia-smi`、`curl` 和 Git。使用有私有仓库读取权限的 GitHub 账户或部署密钥。
 
 ```bash
-sudo bash install.sh --payout YOUR_PUBLIC_ADDRESS --ipmi
+nvidia-smi -L
+git clone https://github.com/1070209147/pearl-gpu-guard.git
+cd pearl-gpu-guard
+sudo bash install.sh --payout '替换为你的PRL公开收款地址'
 ```
 
-有机柜 PDU、UPS 或其他整机电表时，将其读数交给软件：
+参数也可填写 Kryptex Mining Username。每台主机默认用自己的主机名，也可添加 `--worker rig01`。安装脚本下载和校验官方 KRig Linux v1.7.0，并安装及启动 systemd 服务。首次安装后，
 
 ```bash
-sudo bash install.sh --payout YOUR_PUBLIC_ADDRESS --power-file /run/rack-power/host-watts.json
+git pull --ff-only
+sudo bash install.sh
 ```
 
-电表采集程序每 1–5 秒原子更新这个 JSON 文件。读数需要覆盖这台机器的所有电源输入，`sampled_at` 为采样时的 Unix 秒数，服务账号 `pearl-guard` 需要读取权限。使用 `/run` 或 `/var/lib` 下的路径。JSON 示例中的时间戳须由采集程序填写。
-
-```json
-{"watts": 183.5, "sampled_at": 1795097266.5}
-```
-
-运行安装命令会下载官方 KRig Linux v1.7.0、核对 SHA-256 并安装和启动 systemd 服务。以后 `git pull` 后执行 `sudo bash install.sh`，沿用本机配置。要调整时使用 `--timezone Asia/Shanghai --start 23:00 --end 07:00` 并带上收款和电表参数。停止服务可执行 `sudo systemctl stop pearl-gpu-guard`。
+更新沿用本机的收款地址和时段，旧版电表服务会停用。调整时可在带 `--payout` 的安装命令中加入 `--timezone Asia/Shanghai --start 23:00 --end 07:00`。先试一张卡可传入 `--eligible-pci 01:00.0`，以本机的 PCI 地址为准。停止服务使用 `sudo systemctl stop pearl-gpu-guard`，重新启动用 `sudo systemctl start pearl-gpu-guard`。
 
 ## 用户任务优先
 
@@ -34,25 +30,26 @@ sudo bash install.sh --payout YOUR_PUBLIC_ADDRESS --power-file /run/rack-power/h
 pearl-gpu-guard task -- python3 your_gpu_job.py
 ```
 
-请求会在启动任务前登记。控制器检查请求锁后终止矿工并确认进程退出。此时作业才继续。多个作业可以共用该入口，资源分配仍由自己的调度器或任务程序负责。控制器约每秒处理一次请求锁和整机功耗，GPU 和队列默认每 15 秒采样一次。作业都结束且显卡连续空闲观测至少 30 秒后，夜间可恢复挖矿。
+请求会在启动任务前登记。控制器终止矿工，确认进程退出和原功率设置恢复后，作业才继续。多个作业可以共用该入口，GPU 分配由自己的调度器或任务程序负责。控制器约每秒检查本机任务锁，GPU 和 Slurm 队列每 15 秒采样一次。作业都结束且显卡连续空闲至少 30 秒后，夜间可恢复挖矿。
 
-使用 Slurm 时，可在安装命令末尾附加 `--slurm-partition gpu`。控制器查看该 GPU 分区内所有排队与运行作业，并在状态中报告作业状态、已用时间和时限。管理员应确认 `pearl-guard` 能看到其他账户的作业。在调度器的启动命令中也使用上面的包装器，可以确保 GPU 作业等待矿工退出。对未接入该入口的任务，控制器只能在采样时通过已启动的 CUDA 进程或 GPU 状态发现占用。
+使用 Slurm 时，可在安装命令末尾附加 `--slurm-partition gpu`。控制器报告该分区排队与运行的作业、已用时间和时限。在调度器的启动命令中也使用上面的包装器，可以让 GPU 作业等矿工退出。未接入包装器或 Slurm 的任务，要等每轮采样通过 CUDA 进程或 GPU 状态发现。
 
-## 300W 整机预算
+## 单卡 300W
 
-控制器读取八张卡的利用率、显存、温度、板卡功率及驱动实际执行的功率上限。按实测整机空闲功耗、显卡可能增加的功耗和 15W 余量挑选可运行卡。必要时仅启动部分卡。全部卡都放不下时保持暂停。功率读数丢失、过期或达到 300W 时停矿，超预算后本夜不再自动试跑。300W 由采样和停机实现，无法消除采样间的瞬时功率峰值。需要硬上限的服务器应使用平台硬件的整机限功率功能。
+控制器读取八张卡的 GPU 利用率、显存、温度、板卡功率及功率上限。对参与挖矿的卡，将高于 300W 的原设置降到 300W，原本更低的值继续沿用。驱动回读确认后才启动矿工。缺少可用限功率数据的卡不会参与。八张卡同时按上限运行，显卡配置合计可达 2,400W，主机其他部件和电源转换损耗另计。
 
-软件读取现有的卡功率限制。管理员可按显卡支持的范围预先设置或通过平台策略配置硬件功率上限。八张卡均运行取决于各卡的最低可用功率、机箱底载和电源效率。
+设置功率上限需要管理员权限，由 systemd 内的控制器执行。KRig 以 `pearl-guard` 用户运行。原设置按 GPU UUID 保存，到停矿时恢复并回读确认。如果恢复失败，任务包装器会等待，超时后返回错误，原设置仍保存在恢复文件中。可先停止服务，再运行 `sudo pearl-gpu-guard restore-power` 重试。始终保留这份恢复文件直至驱动确认成功。
 
 ## 状态和日志
 
 ```bash
 sudo pearl-gpu-guard status
 sudo journalctl -u pearl-gpu-guard -n 30
+nvidia-smi --query-gpu=index,power.draw,power.limit,enforced.power.limit --format=csv
 ```
 
-状态包括八卡的最近采样、任务请求、Slurm 作业、整机功率与矿工进程。到早晨截止时间，服务停止挖矿并清理自己目录中的当夜详细运行日志和软件临时文件。错过截止时间时在服务下一次运行时补清理。systemd 的启停、故障与清理摘要继续保留。
+状态包括八卡的最近采样、任务请求、Slurm 作业和矿工进程。早上截止后，服务停止挖矿、恢复功率设置并清理自身当夜详细日志和临时文件。错过截止时间时在服务下一次运行时补清理。systemd 的启停、故障与清理摘要继续保留。
 
-本机测试可运行 `python3 -m unittest discover -s tests -v`。自动测试用模拟读数和子进程验证控制逻辑，会消耗极少资源。目标机仍需用真实电表、八张卡与实际任务验证功率和抢占。
+本机测试可运行 `python3 -m unittest discover -s tests -v`。自动测试用模拟 NVIDIA 驱动和 Linux 子进程验证控制逻辑。首次在目标主机试跑时，运行状态命令确认每张参挖卡的设置，再提交实际 GPU 任务确认抢占与功率恢复。
 
 参考 [KRig 官方发布](https://github.com/kryptex/krig-miner/releases/tag/v1.7.0)、[NVIDIA SMI 文档](https://docs.nvidia.com/deploy/nvidia-smi/index.html) 和 [Slurm squeue 说明](https://slurm.schedmd.com/squeue.html)。

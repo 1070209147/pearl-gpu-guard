@@ -12,6 +12,11 @@ from unittest.mock import patch
 import guard
 
 
+def gpu(n=0, requested=450, enforced=450, minimum=100):
+    return guard.GPU(f"{n:02x}:00.0", 0, 0, 24_000, 30, 10, enforced,
+                     f"GPU-00000000-0000-0000-0000-{n:012x}", requested, minimum)
+
+
 class PolicyTests(unittest.TestCase):
     def test_midnight_and_morning_boundary(self):
         start, end = clock(23), clock(7)
@@ -19,21 +24,20 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(guard.night_key(datetime(2026, 11, 20, 6, 59), start, end), "2026-11-19")
         self.assertIsNone(guard.night_key(datetime(2026, 11, 20, 7), start, end))
 
-    def test_power_can_admit_eight_some_or_zero_cards(self):
-        cards = [guard.GPU(f"{n:02x}:00.0", 0, 0, 24_000, 30, 10, 28) for n in range(8)]
-        config = dict(wall_limit_watts=300, headroom_watts=15, psu_efficiency_floor=0.8)
-        self.assertEqual(len(guard.choose_cards(cards, 100, config)), 8)
-        self.assertEqual(len(guard.choose_cards(cards, 210, config)), 3)
-        self.assertEqual(guard.choose_cards(cards, 299, config), [])
-        self.assertEqual(
-            guard.choose_cards(cards, 100, {**config, "eligible_pci": ["02:00.0"]}), [cards[2]]
-        )
+    def test_300_watt_limit_is_per_card(self):
+        cards = [gpu(n) for n in range(8)]
+        self.assertEqual(guard.choose_cards(cards, {}), cards)
+        self.assertEqual(guard.choose_cards(cards, {"eligible_pci": ["02:00.0"]}), [cards[2]])
+        self.assertEqual(guard.choose_cards([gpu(minimum=350), gpu(1, requested=None)], {}), [])
+        lower = gpu(requested=180, enforced=180, minimum=None)
+        self.assertEqual(guard.choose_cards([lower], {}), [lower])
 
     def test_gpu_requires_all_eight_and_supported_measurements(self):
-        rows = [f"00000000:{n:02x}:00.0, 0, 25, 8192, 31, 10, 60" for n in range(8)]
+        rows = [f"00000000:{n:02x}:00.0, 0, 25, 8192, 31, 10, 300, {gpu(n).uuid}, 300, 100"
+                for n in range(8)]
         with patch.object(guard, "command", return_value="\n".join(rows)):
             self.assertEqual(len(guard.read_gpus()), 8)
-        for invalid in (rows[:-1], rows + rows[:1], [rows[0].replace(", 60", ", N/A"), *rows[1:]]):
+        for invalid in (rows[:-1], rows + rows[:1], [rows[0].replace(", 25", ", N/A"), *rows[1:]]):
             with patch.object(guard, "command", return_value="\n".join(invalid)):
                 with self.assertRaises(ValueError):
                     guard.read_gpus()
@@ -50,22 +54,24 @@ class PolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("night-2026-11-18.log", "night-2026-11-19.log", "job.log",
-                         "power-fault.json", "guard-12345678.tmp"):
+                         "restore-power.json", "guard-12345678.tmp"):
                 (root / name).touch()
             self.assertEqual(guard.prune_logs(root, "2026-11-19"), 2)
             self.assertEqual(guard.prune_logs(root, None), 1)
-            self.assertEqual(sorted(p.name for p in root.iterdir()), ["job.log", "power-fault.json"])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["job.log", "restore-power.json"])
 
-    def test_meter_freshness_and_invalid_readings(self):
+    def test_failed_restore_preserves_original_setting(self):
         with tempfile.TemporaryDirectory() as directory:
-            reading = Path(directory) / "power.json"
-            for watts, seconds, valid in ((254, 0, True), (254, 20, False), ("NaN", 0, False)):
-                reading.write_text(json.dumps({"watts": watts, "sampled_at": time.time() - seconds}))
-                if valid:
-                    self.assertEqual(guard.read_wall_power(reading), watts)
-                else:
-                    with self.assertRaises(ValueError):
-                        guard.read_wall_power(reading)
+            with patch.object(guard, "STATE", Path(directory)):
+                record = guard.pending_restore()
+                record.write_text(json.dumps({gpu().uuid: 450}))
+                with patch.object(guard, "command", return_value="300"):
+                    with self.assertRaisesRegex(ValueError, "restore incomplete"):
+                        guard.restore_power()
+                self.assertTrue(record.exists())
+                with patch.object(guard, "command", return_value="450"):
+                    guard.restore_power()
+                self.assertFalse(record.exists())
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux flock and process groups")
@@ -82,7 +88,6 @@ class LinuxIntegrationTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.service = guard.Guard({
             "timezone": "UTC", "start": "00:00", "end": "23:59:59.999999",
-            "power_file": str(self.root / "power.json"), "wall_limit_watts": 300,
         })
         self.addCleanup(os.close, self.service.demand_fd)
         self.addCleanup(os.close, self.service.gpu_fd)
@@ -99,7 +104,7 @@ class LinuxIntegrationTests(unittest.TestCase):
         done = self.root / "job.finished"
         child = subprocess.Popen([
             sys.executable, "-c", "import guard, sys; from pathlib import Path;"
-            "guard.LOCKS=Path(sys.argv[1]); raise SystemExit(guard.run_task(sys.argv[2:]))",
+            "guard.LOCKS=guard.STATE=Path(sys.argv[1]); raise SystemExit(guard.run_task(sys.argv[2:]))",
             str(self.root), sys.executable, "-c",
             "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(done),
         ])
@@ -109,7 +114,13 @@ class LinuxIntegrationTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertTrue(guard.has_demand(self.service.demand_fd))
             self.assertFalse(done.exists())
-            self.service.tick()
+            guard.atomic_json(guard.pending_restore(), {gpu().uuid: 450})
+            def mock_smi(args):
+                self.assertIsNotNone(miner.poll())
+                self.assertFalse(done.exists())
+                return "450"
+            with patch.object(guard, "command", side_effect=mock_smi):
+                self.service.tick()
             self.assertIsNotNone(miner.poll())
             self.assertEqual(child.wait(timeout=5), 0)
             self.assertTrue(done.exists())
@@ -119,14 +130,24 @@ class LinuxIntegrationTests(unittest.TestCase):
                 child.terminate()
                 child.wait(timeout=5)
 
-    def test_over_budget_stops_miner_and_latches_for_that_night(self):
-        miner = self.start_dummy_miner()
-        with patch.object(guard, "read_wall_power", return_value=301):
-            self.service.tick()
-        self.assertIsNotNone(miner.poll())
-        fault = json.loads((self.root / "power-fault.json").read_text())
-        self.assertEqual(fault["watts"], 301)
-        self.assertEqual(self.service.fault_night, fault["night"])
+    def test_preparation_saves_original_caps_before_writing(self):
+        before = [gpu(0), gpu(1, requested=220, enforced=220)]
+        after = [gpu(0, requested=300, enforced=300), before[1]]
+        with patch.object(guard, "read_gpus", return_value=after), \
+             patch.object(guard, "compute_pids", return_value=set()), \
+             patch.object(guard, "set_cap") as setter:
+            setter.side_effect = lambda *_: self.assertEqual(
+                json.loads(guard.pending_restore().read_text()), {before[0].uuid: 450})
+            night = guard.night_key(datetime.now(self.service.zone), self.service.start, self.service.end)
+            self.assertEqual(self.service.prepare_cards(before, night), after)
+            setter.assert_called_once_with(before[0].uuid, 300)
+
+    def test_preparation_refuses_to_mine_if_driver_did_not_apply_cap(self):
+        before = [gpu()]
+        with patch.object(guard, "read_gpus", return_value=before), \
+             patch.object(guard, "set_cap"):
+            with self.assertRaisesRegex(ValueError, "did not verify"):
+                self.service.prepare_cards(before, "2026-11-19")
 
 
 if __name__ == "__main__":
